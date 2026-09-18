@@ -602,6 +602,7 @@ class TestMainLoopKeyIntegration:
             'suppress', 'cursor_up', 'cursor_down', 'cursor_left', 'cursor_right',
             'cursor_off', 'details', 'export', 'log', 'history',
             'perimeter', 'capture', 'alarm_toggle', 'warning_toggle',
+            'interdiction', 'interdiction_stop',
         }
         rflord_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'rflord.py')
         with open(rflord_path) as f:

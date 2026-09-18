@@ -32,6 +32,7 @@ from scan_accel import ScanAccelerator
 from perimeter import PerimeterMode
 from rf_protocols import identify_by_freq as rfproto_identify, get_protocol_count as rfproto_count
 from rule_engine import RuleEngine
+from interdiction import InterdictionEngine, ProtocolJammer, GPSJammer, JAM_MODES
 
 # Load config
 _cfg = load_config()
@@ -1331,6 +1332,10 @@ def _read_key(stdscr):
             return 'alarm_toggle'
         elif key == ord('w') or key == ord('W'):
             return 'warning_toggle'
+        elif key == ord('i') or key == ord('I'):
+            return 'interdiction'
+        elif key == ord('u') or key == ord('U'):
+            return 'interdiction_stop'
         elif key == curses.KEY_UP:
             _cursor_active = True
             return 'cursor_up'
@@ -1884,13 +1889,18 @@ def draw_table(stdscr, signals, start_time, last_seen, alert_count, artemis_db, 
                 key=lambda x: x['peak'], reverse=True)
     ok_grouped = group_signals_by_type(ok, artemis_db)
     
-    # Clamp cursor
+    # Clamp cursor for BOTH panels independently
+    sus_max = max(0, len(sus_grouped) - 1)
+    ok_max = max(0, len(ok_grouped) - 1)
+    
     if _cursor_active:
         active_list = sus_grouped if _cursor_panel == 'sus' else ok_grouped
-        if len(active_list) > 0:
-            _cursor_pos = max(0, min(_cursor_pos, len(active_list) - 1))
-        else:
-            _cursor_pos = 0
+        panel_max = sus_max if _cursor_panel == 'sus' else ok_max
+        # Clamp to the current panel's max first
+        _cursor_pos = max(0, min(_cursor_pos, panel_max))
+        # Then clamp to the other panel's max too (in case we switch panels)
+        other_max = ok_max if _cursor_panel == 'sus' else sus_max
+        _cursor_pos = min(_cursor_pos, other_max)
     else:
         _cursor_pos = 0
 
@@ -2014,6 +2024,12 @@ def draw_table(stdscr, signals, start_time, last_seen, alert_count, artemis_db, 
     peri_str = "ON" if perimeter and perimeter.active else "OFF"
     alarm_str = "ON" if ALARM_ENABLED else "OFF"
     warn_str = "ON" if WARNING_ENABLED else "OFF"
+    
+    # Interdiction status display
+    global INTERDICTION_ACTIVE, interdiction, protocol_jammer, gps_jammer
+    intd_str = "ON" if INTERDICTION_ACTIVE else "OFF"
+    jammer_count = interdiction.get_jammer_count() if 'interdiction' in dir() else 0
+    
     cur_str = ""
     if _cursor_active:
         if _cursor_panel == 'sus' and sus_grouped:
@@ -2021,7 +2037,7 @@ def draw_table(stdscr, signals, start_time, last_seen, alert_count, artemis_db, 
         elif _cursor_panel == 'ok' and ok_grouped:
             cur_str = f" [OK {_cursor_pos+1}/{len(ok_grouped)}]"
     
-    keys = f" q:Quit r:Rescan c:Capture v:Voice({voice_str}) m:Mute s:Suppress({sup_str}) p:Perimeter({peri_str}) a:Alarm({alarm_str}/{ALARM_THRESHOLD_M}m) w:Warning({warn_str}) +/-:Interval({INTERVAL}s) ←→:Panel ↑↓:Nav d:Detail e:Export l:Log h:History{cur_str}{extra}"
+    keys = f" q:Quit r:Rescan c:Capture v:Voice({voice_str}) m:Mute s:Suppress({sup_str}) p:Perimeter({peri_str}) i:Interdiction({intd_str}/{jammer_count}) u:StopJam a:Alarm({alarm_str}/{ALARM_THRESHOLD_M}m) w:Warning({warn_str}) +/-:Interval({INTERVAL}s) ←→:Panel ↑↓:Nav d:Detail e:Export l:Log h:History{cur_str}{extra}"
     try:
         stdscr.addstr(row, 0, keys[:W].ljust(W), curses.color_pair(CP_DIM))
     except: pass
@@ -2030,7 +2046,7 @@ def draw_table(stdscr, signals, start_time, last_seen, alert_count, artemis_db, 
     stdscr.refresh()
 
 def main_curses(stdscr, devices):
-    global INTERVAL, VOICE_THRESHOLD, _cursor_pos, _suppress_active, ALARM_ENABLED, WARNING_ENABLED
+    global INTERVAL, VOICE_THRESHOLD, _cursor_pos, _suppress_active, ALARM_ENABLED, WARNING_ENABLED, INTERDICTION_ACTIVE, _interdiction_mode_idx, _cursor_panel, _cursor_active
     if isinstance(devices, str):
         devices = [devices]  # Backward compat
     device = devices[0]  # Primary device
@@ -2135,6 +2151,18 @@ def main_curses(stdscr, devices):
     
     # Initialize perimeter mode
     perimeter = PerimeterMode()
+    
+    # Initialize interdiction engine (advanced jamming)
+    interdiction = InterdictionEngine(_cfg.get('interdiction', {}))
+    _interdiction_mode_idx = 0  # Index into JAM_MODES for cycling
+    INTERDICTION_ACTIVE = False
+    
+    # Protocol jammers (FPV-specific)
+    protocol_jammer = ProtocolJammer()
+    
+    # GPS jammer
+    gps_jammer = GPSJammer() if _cfg.get('interdiction', {}).get('gps_jamming', False) else None
+
     wifi_iface = "wlan0"  # Default WiFi interface
     # Detect WiFi interface (cross-platform)
     try:
@@ -2466,6 +2494,43 @@ def main_curses(stdscr, devices):
             for f in newly_jammed:
                 alert_count += 1
                 log.warning(f"PERIMETER: auto-jammed {f:.1f} MHz")
+        
+        # Advanced interdiction — protocol-specific jamming
+        if INTERDICTION_ACTIVE:
+            try:
+                newly_interdicted = interdiction.process_scan(unique, known_freqs, classify)
+                for f in newly_interdicted:
+                    alert_count += 1
+                    log.warning(f"INTERDICTION: armed jam at {f:.1f} MHz")
+                
+                # Protocol-specific jammers for FPV drones
+                if _cfg.get('interdiction', {}).get('protocol_specific', True):
+                    for s in unique:
+                        f = s['freq'] / 1e6
+                        cls = classify(f, s['peak'], s['std'])
+                        if cls in ('sus', 'danger'):
+                            # ExpressLRS on 900MHz band
+                            if 910 <= f <= 920:
+                                protocol_jammer.jamm_expresslrs(freq_mhz=f)
+                            # FPV bands — SmartProtocol burst jamming
+                            elif 2408 <= f <= 2470:
+                                protocol_jammer.jamm_smartprotocol(freq_mhz=f)
+                            # TBS Crossfire
+                            elif 430 <= f <= 435 or 865 <= f <= 870:
+                                protocol_jammer.jamm_crossfire(freq_mhz=f)
+            except Exception as e:
+                log.error(f"INTERDICTION error: {e}")
+        
+        # GPS jamming (if enabled)
+        if gps_jammer and INTERDICTION_ACTIVE:
+            try:
+                for gps_band in GPS_BANDS:
+                    f = gps_band['freq_mhz']
+                    cls = classify(f, 0, 0)
+                    if cls in ('sus', 'danger'):
+                        gps_jammer.jam_l1() if 'L1' in gps_band['name'] else gps_jammer.jam_l2()
+            except Exception as e:
+                log.error(f"GPS JAMMER error: {e}")
         
         # Update "last seen" for ALL signals
         now = time.time()
@@ -2809,6 +2874,49 @@ def main_curses(stdscr, devices):
                         perimeter.stop_all()
                         log.warning("PERIMETER: SECURED MODE DEACTIVATED")
                         speak("Perimeter secured mode deactivated")
+                draw_table(stdscr, unique, start_time, last_seen, alert_count, artemis_db, known_freqs, voice_enabled, history, web_url, assessment, perimeter)
+            elif key == 'interdiction':
+                if not has_hackrf:
+                    log.warning("INTERDICTION: HackRF required for jamming")
+                    draw_table(stdscr, unique, start_time, last_seen, alert_count, artemis_db, known_freqs, voice_enabled, history, web_url, assessment, perimeter)
+                else:
+                    if not INTERDICTION_ACTIVE:
+                        # Activate interdiction — use selected mode
+                        jammers = [m for m in JAM_MODES.keys() if m != 'sweep']  # Exclude sweep from cycling
+                        if jammers:
+                            current_mode = jammers[_interdiction_mode_idx % len(jammers)]
+                            _interdiction_mode_idx += 1
+                            INTERDICTION_ACTIVE = True
+                            
+                            # Apply mode to all currently suspicious signals
+                            for s in unique:
+                                f = s['freq'] / 1e6
+                                cls = classify(f, s['peak'], s['std'])
+                                if cls in ('sus', 'danger'):
+                                    interdiction.set_mode(f, current_mode)
+                            
+                            log.warning(f"INTERDICTION: ACTIVATED ({current_mode} mode)")
+                            speak(f"Interdiction activated. {interdiction.get_jammer_count()} jammers armed.")
+                    else:
+                        # Cycle to next jamming mode
+                        all_modes = list(JAM_MODES.keys())
+                        current_mode_idx = all_modes.index('sweep') if 'sweep' in all_modes else 0
+                        _interdiction_mode_idx = (_interdiction_mode_idx + 1) % len(all_modes)
+                        next_mode = all_modes[_interdiction_mode_idx]
+                        
+                        # Update all active jammers with new mode
+                        for freq_key, proc in list(interdiction.active_jammers.items()):
+                            if proc.is_running:
+                                proc.mode = next_mode
+                        
+                        log.info(f"INTERDICTION: Mode changed to {next_mode}")
+                    draw_table(stdscr, unique, start_time, last_seen, alert_count, artemis_db, known_freqs, voice_enabled, history, web_url, assessment, perimeter)
+            elif key == 'interdiction_stop':
+                # Stop all interdiction jamming
+                interdiction.stop_all()
+                protocol_jammer.stop_all()
+                INTERDICTION_ACTIVE = False
+                log.warning("INTERDICTION: All jamming stopped")
                 draw_table(stdscr, unique, start_time, last_seen, alert_count, artemis_db, known_freqs, voice_enabled, history, web_url, assessment, perimeter)
             elif key == 'cursor_up':
                 _cursor_pos = max(0, _cursor_pos - 1)

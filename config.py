@@ -52,6 +52,21 @@ DEFAULTS = {
         'enabled': True,
         'port': 8080,
     },
+    'interdiction': {
+        'enabled': True,
+        'auto_jam_threshold': 'danger',  # 'danger' or 'sus' — jam at which classification level
+        'max_concurrent_jammers': 8,
+        'auto_restart_interval': 55,  # seconds before restarting evicted jammers
+        'protocol_specific': True,
+        'gps_jamming': False,
+        'modes': {
+            'default': 'noise',  # noise, chirp, tone, burst, sweep
+            'fpv_2400': 'burst',
+            'fpv_900': 'chirp',
+            'gps_l1': 'gps_l1',
+            'gps_l2': 'gps_l2',
+        },
+    },
     'blacklist': {
         'file': '~/.config/rflord/ignore.conf',
     },
